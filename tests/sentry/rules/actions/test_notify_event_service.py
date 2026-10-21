@@ -1,34 +1,110 @@
+from typing import cast
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+import pytest
+import responses
 from django.utils import timezone
 
-from sentry.utils.compat.mock import MagicMock, patch
+from sentry.eventstream.types import EventStreamEventType
+from sentry.grouping.grouptype import ErrorGroupType
+from sentry.incidents.endpoints.serializers.incident import IncidentSerializerResponse
+from sentry.incidents.models.incident import IncidentStatus
+from sentry.incidents.typings.metric_detector import (
+    AlertContext,
+    MetricIssueContext,
+    NotificationContext,
+)
+from sentry.models.options.project_option import ProjectOption
+from sentry.rules.actions.notify_event_service import (
+    NotifyEventServiceAction,
+    send_incident_alert_notification,
+)
+from sentry.sentry_apps.tasks.sentry_apps import notify_sentry_app
+from sentry.silo.base import SiloMode
+from sentry.tasks.post_process import post_process_group
+from sentry.testutils.cases import RuleTestCase, TestCase
+from sentry.testutils.silo import assume_test_silo_mode
+from sentry.testutils.skips import requires_snuba
+from sentry.utils import json
+from sentry.workflow_engine.typings.grouptype import IssueStreamGroupType
+from tests.sentry.workflow_engine.test_base import BaseWorkflowTest
 
-from sentry.testutils.cases import RuleTestCase
-from sentry.rules.actions.notify_event_service import NotifyEventServiceAction
-from sentry.tasks.sentry_apps import notify_sentry_app
+pytestmark = [requires_snuba]
 
 
-class NotifyEventServiceActionTest(RuleTestCase):
+class NotifyEventServiceWebhookActionTest(RuleTestCase, BaseWorkflowTest):
     rule_cls = NotifyEventServiceAction
 
-    def test_applies_correctly_for_plugins(self):
-        event = self.get_event()
+    def setUp(self) -> None:
+        self.event = self.get_event()
+        ProjectOption.objects.set_value(
+            project=self.event.project, key="webhooks:urls", value="http://my-fake-webhook.io"
+        )
+        ProjectOption.objects.set_value(
+            project=self.event.project, key="webhooks:enabled", value=True
+        )
 
-        plugin = MagicMock()
-        plugin.is_enabled.return_value = True
-        plugin.should_notify.return_value = True
+    @responses.activate
+    def test_applies_correctly_for_legacy_webhooks_aci(self) -> None:
+        responses.add(responses.POST, "http://my-fake-webhook.io")
 
-        rule = self.get_rule(data={"service": "mail"})
+        (
+            error_workflow,
+            error_detector,
+            detector_workflow_error,
+            condition_group,
+        ) = self.create_detector_and_workflow(
+            name_prefix="error",
+            workflow_triggers=self.create_data_condition_group(),
+            detector_type=ErrorGroupType.slug,
+        )
+        self.create_workflow_data_condition_group(
+            workflow=error_workflow, condition_group=condition_group
+        )
+        # create webhook action
+        action = self.create_action(
+            config={
+                "target_type": None,
+                "target_display": None,
+                "target_identifier": "webhooks",
+            },
+            type="webhook",
+            data={},
+        )
+        self.create_data_condition_group_action(condition_group=condition_group, action=action)
 
-        with patch("sentry.plugins.base.plugins.get") as get_plugin:
-            get_plugin.return_value = plugin
+        # create issue stream detector
+        self.create_detector(
+            project=self.project,
+            type=IssueStreamGroupType.slug,
+        )
 
-            results = list(rule.after(event=event, state=self.get_state()))
+        with self.tasks():
+            post_process_group(
+                is_new=True,
+                is_regression=False,
+                is_new_group_environment=False,
+                group_id=self.event.group_id,
+                event_id=self.event.event_id,
+                project_id=self.event.project.id,
+                eventstream_type=EventStreamEventType.Error.value,
+            )
 
-        assert len(results) == 1
-        assert plugin.should_notify.call_count == 1
-        assert results[0].callback is plugin.rule_notify
+        assert len(responses.calls) == 1
 
-    def test_applies_correctly_for_sentry_apps(self):
+        payload = json.loads(responses.calls[0].request.body)
+        assert payload["level"] == "error"
+        assert payload["message"] == "こんにちは"
+        assert payload["event"]["id"] == self.event.event_id
+        assert payload["event"]["event_id"] == self.event.event_id
+        assert payload["triggering_rules"] == ["error_workflow"]
+
+
+class NotifyEventServiceSentryAppActionTest(RuleTestCase, BaseWorkflowTest):
+    rule_cls = NotifyEventServiceAction
+
+    def test_applies_correctly_for_sentry_apps(self) -> None:
         event = self.get_event()
 
         self.create_sentry_app(
@@ -37,33 +113,12 @@ class NotifyEventServiceActionTest(RuleTestCase):
 
         rule = self.get_rule(data={"service": "test-application"})
 
-        results = list(rule.after(event=event, state=self.get_state()))
+        results = list(rule.after(event=event))
 
         assert len(results) == 1
         assert results[0].callback is notify_sentry_app
 
-    def test_notify_sentry_app_and_plugin_with_same_slug(self):
-        event = self.get_event()
-
-        self.create_sentry_app(organization=event.organization, name="Notify", is_alertable=True)
-
-        plugin = MagicMock()
-        plugin.is_enabled.return_value = True
-        plugin.should_notify.return_value = True
-
-        rule = self.get_rule(data={"service": "notify"})
-
-        with patch("sentry.plugins.base.plugins.get") as get_plugin:
-            get_plugin.return_value = plugin
-
-            results = list(rule.after(event=event, state=self.get_state()))
-
-        assert len(results) == 2
-        assert plugin.should_notify.call_count == 1
-        assert results[0].callback is notify_sentry_app
-        assert results[1].callback is plugin.rule_notify
-
-    def test_sentry_app_installed(self):
+    def test_sentry_app_installed(self) -> None:
         event = self.get_event()
 
         self.create_sentry_app(
@@ -80,7 +135,94 @@ class NotifyEventServiceActionTest(RuleTestCase):
         assert len(results) == 1
 
         self.install.date_deleted = timezone.now()
-        self.install.save()
+        with assume_test_silo_mode(SiloMode.CONTROL):
+            self.install.save()
 
         results = rule.get_services()
         assert len(results) == 0
+
+
+class TestSendIncidentAlertNotification(TestCase):
+    def setUp(self) -> None:
+        self.project = self.create_project(organization=self.organization)
+        self.sentry_app = self.create_sentry_app(organization=self.organization)
+        self.alert_rule = self.create_alert_rule()
+        self.incident = self.create_incident(alert_rule=self.alert_rule)
+        self.alert_context = AlertContext.from_alert_rule_incident(self.alert_rule)
+        self.metric_issue_context = MetricIssueContext.from_legacy_models(
+            self.incident, IncidentStatus.CRITICAL, metric_value=100.0
+        )
+        self.incident_serialized_response = cast(IncidentSerializerResponse, {})
+        self.notification_context = NotificationContext(
+            id=1,
+            sentry_app_id=self.sentry_app.id,
+        )
+        self.notification_uuid = str(uuid4())
+
+    @patch("sentry.rules.actions.notify_event_service.send_metric_alert_webhook")
+    def test_dispatches_task_with_correct_kwargs(self, mock_task: MagicMock) -> None:
+        send_incident_alert_notification(
+            notification_context=self.notification_context,
+            alert_context=self.alert_context,
+            metric_issue_context=self.metric_issue_context,
+            incident_serialized_response=self.incident_serialized_response,
+            organization=self.organization,
+            project_id=self.project.id,
+            notification_uuid=self.notification_uuid,
+        )
+
+        mock_task.delay.assert_called_once()
+        call_kwargs = mock_task.delay.call_args.kwargs
+        assert call_kwargs["sentry_app_id"] == self.sentry_app.id
+        assert call_kwargs["new_status"] == IncidentStatus.CRITICAL.value
+        assert call_kwargs["organization_id"] == self.organization.id
+        assert call_kwargs["project_id"] == self.project.id
+        assert call_kwargs["alert_id"] == self.alert_rule.id
+        assert call_kwargs["notification_uuid"] == self.notification_uuid
+
+        attachment = json.loads(call_kwargs["incident_attachment_json"])
+        assert "metric_alert" in attachment
+        assert "description_title" in attachment
+        assert "description_text" in attachment
+        assert "web_url" in attachment
+
+    @patch("sentry.rules.actions.notify_event_service.send_metric_alert_webhook")
+    def test_raises_when_sentry_app_id_is_none(self, mock_task: MagicMock) -> None:
+        notification_context_no_app = NotificationContext(id=1, sentry_app_id=None)
+
+        with pytest.raises(ValueError, match="Sentry app ID is required"):
+            send_incident_alert_notification(
+                notification_context=notification_context_no_app,
+                alert_context=self.alert_context,
+                metric_issue_context=self.metric_issue_context,
+                incident_serialized_response=self.incident_serialized_response,
+                organization=self.organization,
+                project_id=self.project.id,
+                notification_uuid=self.notification_uuid,
+            )
+
+        mock_task.delay.assert_not_called()
+
+    @patch("sentry.utils.sentry_apps.webhooks.safe_urlopen")
+    def test_end_to_end_sends_webhook(self, safe_urlopen: MagicMock) -> None:
+        safe_urlopen.return_value = MagicMock(status_code=200, headers={})
+        install = self.create_sentry_app_installation(
+            organization=self.organization, slug=self.sentry_app.slug
+        )
+
+        with self.tasks():
+            send_incident_alert_notification(
+                notification_context=self.notification_context,
+                alert_context=self.alert_context,
+                metric_issue_context=self.metric_issue_context,
+                incident_serialized_response=self.incident_serialized_response,
+                organization=self.organization,
+                project_id=self.project.id,
+                notification_uuid=self.notification_uuid,
+            )
+
+        safe_urlopen.assert_called_once()
+        _, call_kwargs = safe_urlopen.call_args
+        body = json.loads(call_kwargs["data"])
+        assert body["action"] == "critical"
+        assert body["installation"]["uuid"] == install.uuid

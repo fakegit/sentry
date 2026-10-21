@@ -1,13 +1,8 @@
-from collections import Mapping, Set, Sequence
-
-from sentry.utils.compat import map
+from collections.abc import Mapping, Sequence, Set
 
 
 class Encoder:
-    try:
-        number_types = (int, long, float)  # noqa
-    except NameError:
-        number_types = (int, float)
+    number_types = (int, float)
 
     def __init__(self, types=None):
         self.types = types if types is not None else {}
@@ -32,4 +27,4 @@ class Encoder:
                 sorted(b"\x01".join(map(self.dumps, item)) for item in value.items())
             )
         else:
-            raise TypeError("Unsupported type: {}".format(type(value)))
+            raise TypeError(f"Unsupported type: {type(value)}")

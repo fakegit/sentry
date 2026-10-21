@@ -11,15 +11,16 @@ By default account id and token expiration time are stored in extra_data
 field, check OAuthBackend class for details on how to extend it.
 """
 
-from django.conf import settings
 from urllib.error import HTTPError
 from urllib.request import Request
-from social_auth.utils import dsa_urlopen
+
+from django.conf import settings
+
+from sentry.integrations.types import IntegrationProviderSlug
+from sentry.utils import json
 from social_auth.backends import BaseOAuth2, OAuthBackend
 from social_auth.exceptions import AuthFailed
-
-from sentry.utils import json
-
+from social_auth.utils import dsa_urlopen
 
 # GitHub configuration
 GITHUB_BASE_DOMAIN = getattr(settings, "GITHUB_BASE_DOMAIN", "github.com")
@@ -35,7 +36,7 @@ GITHUB_ORGANIZATION_MEMBER_OF_URL = "https://%s/orgs/{org}/members/{username}" %
 class GithubBackend(OAuthBackend):
     """Github OAuth authentication backend"""
 
-    name = "github"
+    name = IntegrationProviderSlug.GITHUB.value
     # Default extra data to store
     EXTRA_DATA = [("id", "id"), ("expires", "expires")]
 
@@ -115,9 +116,9 @@ class GithubAuth(BaseOAuth2):
                 # if the user is a member of the organization, response code
                 # will be 204, see http://bit.ly/ZS6vFl
                 if response.code != 204:
-                    raise AuthFailed("User doesn't belong to the " "organization")
+                    raise AuthFailed("User doesn't belong to the organization")
         return data
 
 
 # Backend definition
-BACKENDS = {"github": GithubAuth}
+BACKENDS = {IntegrationProviderSlug.GITHUB.value: GithubAuth}

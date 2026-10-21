@@ -1,39 +1,90 @@
+from __future__ import annotations
+
 import logging
+from typing import Any
+from urllib.parse import urlparse
 
-from django.conf import settings
-from django.db import IntegrityError, transaction
-from django.utils import timezone
+from django.contrib.auth.views import redirect_to_login
+from django.http import HttpRequest, HttpResponse
+from django.http.response import HttpResponseBase
+from django.urls import reverse
+from django.utils.decorators import method_decorator
 from django.utils.safestring import mark_safe
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from django.views.decorators.cache import never_cache
 
-from sentry.models import ApiApplication, ApiApplicationStatus, ApiAuthorization, ApiGrant, ApiToken
-from sentry.web.frontend.auth_login import AuthLoginView
+from sentry import analytics, options
+from sentry.analytics.events.oauth_consent import OAuthConsentEvent
+from sentry.api.helpers.oauth_authorize.approval import approve_authorization
+from sentry.api.helpers.oauth_authorize.request import build_authorization_request
+from sentry.api.helpers.oauth_authorize.response import (
+    InvalidAuthorizationRequest,
+    OAuthRedirectError,
+    build_redirect_url,
+)
+from sentry.api.helpers.oauth_authorize.transactions import (
+    consume_authorization_transaction,
+    prune_authorization_transactions,
+    save_authorization_transaction,
+)
+from sentry.api.helpers.oauth_consent import (
+    get_organization_options,
+    get_permission_descriptions,
+    has_existing_consent,
+)
+from sentry.api.serializers.rest_framework.oauth_authorize import OAuthAuthorizeQuerySerializer
+from sentry.ratelimits.config import RateLimitConfig
+from sentry.types.ratelimit import RateLimit, RateLimitCategory
+from sentry.utils import auth
+from sentry.web.client_config import get_client_config
+from sentry.web.frontend.base import BaseView, control_silo_view
+from sentry.web.frontend.react_page import ReactMixin
 
-logger = logging.getLogger("sentry.api")
+logger = logging.getLogger("sentry.oauth")
 
 
-class OAuthAuthorizeView(AuthLoginView):
-    auth_required = False
+@control_silo_view
+@method_decorator(never_cache, name="dispatch")
+class OAuthAuthorizeView(BaseView, ReactMixin):
+    enforce_rate_limit = True
+    rate_limits = RateLimitConfig(
+        limit_overrides={"GET": {RateLimitCategory.IP: RateLimit(limit=20, window=1)}}
+    )
 
-    def get_next_uri(self, request):
-        return request.get_full_path()
+    def is_auth_required(self, request: HttpRequest, *args: Any, **kwargs: Any) -> bool:
+        # GET validates OAuth parameters before prompting for authentication.
+        if request.method == "GET":
+            return False
+
+        return super().is_auth_required(request, *args, **kwargs)
+
+    def handle_auth_required(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
+        auth.initiate_login(request, next_url=request.get_full_path())
+
+        response = redirect_to_login(request.get_full_path(), reverse("sentry-login"))
+        response["X-Robots-Tag"] = "noindex, nofollow"
+        return response
+
+    def get_context_data(self, request: HttpRequest, **kwargs) -> dict:
+        return {
+            **super().get_context_data(request, **kwargs),
+            "react_config": get_client_config(request, self.active_organization),
+        }
 
     def redirect_response(self, response_type, redirect_uri, params):
-        if response_type == "token":
-            return self.redirect(
-                "{}#{}".format(
-                    redirect_uri,
-                    urlencode([(k, v) for k, v in params.items() if v is not None]),
-                )
-            )
+        return self.redirect_to_callback(build_redirect_url(response_type, redirect_uri, params))
 
-        parts = list(urlparse(redirect_uri))
-        query = parse_qsl(parts[4])
-        for key, value in params.items():
-            if value is not None:
-                query.append((key, value))
-        parts[4] = urlencode(query)
-        return self.redirect(urlunparse(parts))
+    def redirect_to_callback(self, final_uri: str) -> HttpResponseBase:
+        # Django's HttpResponseRedirect blocks custom URL schemes for security.
+        # For OAuth redirects to Sentry Apple apps, we need to support the
+        # sentry-apple:// scheme, so we use HttpResponse with a Location
+        # header directly.
+        parsed_uri = urlparse(final_uri)
+        if parsed_uri.scheme == "sentry-apple" or parsed_uri.scheme == "sentry-replay-debugger":
+            response = HttpResponse(status=302)
+            response["Location"] = final_uri
+            return response
+
+        return self.redirect(final_uri)
 
     def error(
         self,
@@ -45,7 +96,7 @@ class OAuthAuthorizeView(AuthLoginView):
         client_id=None,
         err_response=None,
     ):
-        logging.error(
+        logger.error(
             "oauth.authorize-error",
             extra={
                 "error_name": name,
@@ -63,253 +114,116 @@ class OAuthAuthorizeView(AuthLoginView):
 
         return self.redirect_response(response_type, redirect_uri, {"error": name, "state": state})
 
-    def respond_login(self, request, context, application, **kwargs):
-        context["banner"] = f"Connect Sentry to {application.name}"
-        return self.respond("sentry/login.html", context)
-
-    def get(self, request, **kwargs):
-        response_type = request.GET.get("response_type")
-        client_id = request.GET.get("client_id")
-        redirect_uri = request.GET.get("redirect_uri")
-        scopes = request.GET.get("scope")
-        state = request.GET.get("state")
-        force_prompt = request.GET.get("force_prompt")
-
-        if not client_id:
-            return self.error(
-                request=request,
-                client_id=client_id,
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                name="unauthorized_client",
-                err_response="client_id",
-            )
+    def get(self, request: HttpRequest, **kwargs) -> HttpResponseBase:
+        if options.get("auth.oauth-react-enabled"):
+            return self.handle_react(request)
 
         try:
-            application = ApiApplication.objects.get(
-                client_id=client_id, status=ApiApplicationStatus.active
-            )
-        except ApiApplication.DoesNotExist:
-            return self.error(
-                request=request,
-                client_id=client_id,
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                name="unauthorized_client",
-                err_response="client_id",
-            )
-
-        if not redirect_uri:
-            redirect_uri = application.get_default_redirect_uri()
-        elif not application.is_valid_redirect_uri(redirect_uri):
-            return self.error(
-                request=request,
-                client_id=client_id,
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                name="invalid_request",
-                err_response="redirect_uri",
-            )
-
-        if not application.is_allowed_response_type(response_type):
-            return self.error(
-                request=request,
-                client_id=client_id,
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                name="unsupported_response_type",
-                err_response="client_id",
-            )
-
-        if scopes:
-            scopes = scopes.split(" ")
-            for scope in scopes:
-                if scope not in settings.SENTRY_SCOPES:
-                    return self.error(
-                        request=request,
-                        client_id=client_id,
-                        response_type=response_type,
-                        redirect_uri=redirect_uri,
-                        name="invalid_scope",
-                        state=state,
-                    )
-        else:
-            scopes = []
-
-        payload = {
-            "rt": response_type,
-            "cid": client_id,
-            "ru": redirect_uri,
-            "sc": scopes,
-            "st": state,
-            "uid": request.user.id if request.user.is_authenticated() else "",
-        }
-        request.session["oa2"] = payload
-
-        if not request.user.is_authenticated():
-            return super().get(request, application=application)
-
-        if not force_prompt:
-            try:
-                existing_auth = ApiAuthorization.objects.get(
-                    user=request.user, application=application
+            serializer = OAuthAuthorizeQuerySerializer(data=request.GET)
+            if not serializer.is_valid():
+                raise InvalidAuthorizationRequest(
+                    "Missing or invalid client_id parameter.", parameter="client_id"
                 )
-            except ApiAuthorization.DoesNotExist:
-                pass
-            else:
-                # if we've already approved all of the required scopes
-                # we can skip prompting the user
-                if all(existing_auth.has_scope(s) for s in scopes):
-                    return self.approve(
-                        request=request,
-                        application=application,
-                        scopes=scopes,
-                        response_type=response_type,
-                        redirect_uri=redirect_uri,
-                        state=state,
-                    )
 
-        payload = {
-            "rt": response_type,
-            "cid": client_id,
-            "ru": redirect_uri,
-            "sc": scopes,
-            "st": state,
-            "uid": request.user.id,
-        }
-        request.session["oa2"] = payload
+            authorization = build_authorization_request(serializer.validated_data)
+        except InvalidAuthorizationRequest as exc:
+            return self.error(
+                request=request,
+                client_id=request.GET.get("client_id"),
+                response_type=request.GET.get("response_type"),
+                redirect_uri=request.GET.get("redirect_uri"),
+                name="invalid_request",
+                err_response=exc.parameter,
+            )
+        except OAuthRedirectError as exc:
+            return self.redirect_to_callback(exc.redirect_url)
 
-        permissions = []
-        if scopes:
-            pending_scopes = set(scopes)
-            matched_sets = set()
-            for scope_set in settings.SENTRY_SCOPE_SETS:
-                for scope, description in scope_set:
-                    if scope_set in matched_sets and scope in pending_scopes:
-                        pending_scopes.remove(scope)
-                    elif scope in pending_scopes:
-                        permissions.append(description)
-                        matched_sets.add(scope_set)
-                        pending_scopes.remove(scope)
+        if super().is_auth_required(request, **kwargs):
+            return self.handle_auth_required(request, **kwargs)
 
-            if pending_scopes:
-                raise NotImplementedError(f"{pending_scopes} scopes did not have descriptions")
+        assert request.user.is_authenticated
+        application = authorization.application
+        prune_authorization_transactions(request.session)
+        if not request.GET.get("force_prompt") and has_existing_consent(
+            application, request.user.id, authorization.scopes
+        ):
+            return self.redirect_to_callback(approve_authorization(authorization, request.user.id))
 
-        context = {
-            "user": request.user,
-            "application": application,
-            "scopes": scopes,
-            "permissions": permissions,
-        }
-        return self.respond("sentry/oauth-authorize.html", context)
-
-    def post(self, request, **kwargs):
-        try:
-            payload = request.session["oa2"]
-        except KeyError:
+        organization_options = get_organization_options(application, request.user.id)
+        if application.requires_org_level_access and not organization_options:
             return self.respond(
                 "sentry/oauth-error.html",
                 {
-                    "error": "We were unable to complete your request. Please re-initiate the authorization flow."
+                    "error": "This authorization flow is only available for users who are members of an organization."
                 },
+                status=400,
             )
+
+        transaction_id = save_authorization_transaction(
+            request.session, authorization, request.user.id
+        )
+        analytics.record(
+            OAuthConsentEvent(
+                user_id=request.user.id,
+                application_id=application.id,
+                response_type=authorization.response_type,
+                outcome="viewed",
+            )
+        )
+        return self.respond(
+            "sentry/oauth-authorize.html",
+            {
+                "user": request.user,
+                "application": application,
+                "scopes": authorization.scopes,
+                "permissions": get_permission_descriptions(authorization.scopes),
+                "organization_options": organization_options,
+                "tx_id": transaction_id,
+            },
+        )
+
+    def post(self, request: HttpRequest, **kwargs) -> HttpResponseBase:
+        assert request.user.is_authenticated
 
         try:
-            application = ApiApplication.objects.get(
-                client_id=payload["cid"], status=ApiApplicationStatus.active
+            authorization = consume_authorization_transaction(
+                request.session, request.POST.get("tx_id", ""), request.user.id
             )
-        except ApiApplication.DoesNotExist:
-            return self.respond(
-                "sentry/oauth-error.html",
-                {"error": mark_safe("Missing or invalid <em>client_id</em> parameter.")},
+        except InvalidAuthorizationRequest as exc:
+            error = (
+                mark_safe(f"Missing or invalid <em>{exc.parameter}</em> parameter.")
+                if exc.parameter
+                else exc.public_message
             )
-
-        if not request.user.is_authenticated():
-            response = super().post(request, application=application, **kwargs)
-            # once they login, bind their user ID
-            if request.user.is_authenticated():
-                request.session["oa2"]["uid"] = request.user.id
-                request.session.modified = True
-            return response
-
-        if payload["uid"] != request.user.id:
-            return self.respond(
-                "sentry/oauth-error.html",
-                {
-                    "error": "We were unable to complete your request. Please re-initiate the authorization flow."
-                },
-            )
-
-        response_type = payload["rt"]
-        redirect_uri = payload["ru"]
-        scopes = payload["sc"]
+            return self.respond("sentry/oauth-error.html", {"error": error})
 
         op = request.POST.get("op")
-        if op == "approve":
-            return self.approve(
-                request=request,
-                application=application,
-                scopes=scopes,
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                state=payload["st"],
-            )
-
-        elif op == "deny":
-            return self.error(
-                request=request,
-                client_id=payload["cid"],
-                response_type=response_type,
-                redirect_uri=redirect_uri,
-                name="access_denied",
-                state=payload["st"],
-            )
-        else:
+        if op not in ("approve", "deny"):
             raise NotImplementedError
 
-    def approve(self, request, application, **params):
+        analytics.record(
+            OAuthConsentEvent(
+                user_id=request.user.id,
+                application_id=authorization.application.id,
+                response_type=authorization.response_type,
+                outcome="approved" if op == "approve" else "denied",
+            )
+        )
+        if op == "deny":
+            return self.error(
+                request=request,
+                client_id=authorization.application.client_id,
+                response_type=authorization.response_type,
+                redirect_uri=authorization.redirect_uri,
+                name="access_denied",
+                state=authorization.state,
+            )
+
         try:
-            with transaction.atomic():
-                ApiAuthorization.objects.create(
-                    application=application, user=request.user, scope_list=params["scopes"]
-                )
-        except IntegrityError:
-            if params["scopes"]:
-                auth = ApiAuthorization.objects.get(application=application, user=request.user)
-                for scope in params["scopes"]:
-                    if scope not in auth.scope_list:
-                        auth.scope_list.append(scope)
-                auth.save()
+            redirect_url = approve_authorization(
+                authorization, request.user.id, request.POST.get("selected_organization_id")
+            )
+        except OAuthRedirectError as exc:
+            return self.redirect_to_callback(exc.redirect_url)
 
-        if params["response_type"] == "code":
-            grant = ApiGrant.objects.create(
-                user=request.user,
-                application=application,
-                redirect_uri=params["redirect_uri"],
-                scope_list=params["scopes"],
-            )
-            return self.redirect_response(
-                params["response_type"],
-                params["redirect_uri"],
-                {"code": grant.code, "state": params["state"]},
-            )
-        elif params["response_type"] == "token":
-            token = ApiToken.objects.create(
-                application=application,
-                user=request.user,
-                refresh_token=None,
-                scope_list=params["scopes"],
-            )
-
-            return self.redirect_response(
-                params["response_type"],
-                params["redirect_uri"],
-                {
-                    "access_token": token.token,
-                    "expires_in": int((timezone.now() - token.expires_at).total_seconds()),
-                    "expires_at": token.expires_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                    "token_type": "bearer",
-                    "scope": " ".join(token.get_scopes()),  # NOQA
-                    "state": params["state"],
-                },
-            )
+        return self.redirect_to_callback(redirect_url)

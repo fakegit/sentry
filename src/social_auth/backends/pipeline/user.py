@@ -1,13 +1,10 @@
 from uuid import uuid4
 
-from social_auth.utils import setting, module_member
-from social_auth.models import UserSocialAuth
 from social_auth.django_compat import get_all_field_names
+from social_auth.models import UserSocialAuth
+from social_auth.utils import module_member, setting
 
-
-slugify = module_member(
-    setting("SOCIAL_AUTH_SLUGIFY_FUNCTION", "django.template.defaultfilters.slugify")
-)
+slugify = module_member(setting("SOCIAL_AUTH_SLUGIFY_FUNCTION", "django.utils.text.slugify"))
 
 
 def get_username(
@@ -108,9 +105,9 @@ def update_user_details(backend, details, response, user=None, is_new=False, *ar
         # do not update username, it was already generated, do not update
         # configured fields if user already existed
         if not _ignore_field(name, is_new):
-            if value and value != getattr(user, name, None):
+            if hasattr(user, name) and value and value != getattr(user, name, None):
                 setattr(user, name, value)
                 changed = True
 
-    if changed:
+    if changed and hasattr(user, "save"):
         user.save()

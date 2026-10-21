@@ -1,16 +1,17 @@
 ---
-created: '2019-06-05T20:07:56.986283Z'
-creator: sentry
-source: tests/sentry/event_manager/interfaces/test_exception.py
+source: tests/sentry/event_manager/interfaces/test_exception.py::test_context_with_only_app_frames
 ---
 errors: null
 get_api_context:
   excOmitted: null
-  hasSystemFrames: false
+  hasSystemFrames: true
   values:
   - mechanism: null
     module: foo.bar
+    rawModule: null
     rawStacktrace: null
+    rawType: null
+    rawValue: null
     stacktrace:
       frames:
       - absPath: foo/baz.py
@@ -19,26 +20,33 @@ get_api_context:
         errors: null
         filename: foo/baz.py
         function: null
-        inApp: false
+        inApp: true
         instructionAddr: null
         lineNo: 1
+        lock: null
         module: null
         package: null
+        parentIndex: null
         platform: null
         rawFunction: null
+        sampleCount: null
+        sourceLink: null
         symbol: null
         symbolAddr: null
         trust: null
         vars: null
       framesOmitted: null
-      hasSystemFrames: false
+      hasSystemFrames: true
       registers: null
     threadId: null
     type: ValueError
     value: hello world
   - mechanism: null
     module: foo.bar
+    rawModule: null
     rawStacktrace: null
+    rawType: null
+    rawValue: null
     stacktrace:
       frames:
       - absPath: foo/baz.py
@@ -47,19 +55,23 @@ get_api_context:
         errors: null
         filename: foo/baz.py
         function: null
-        inApp: false
+        inApp: true
         instructionAddr: null
         lineNo: 1
+        lock: null
         module: null
         package: null
+        parentIndex: null
         platform: null
         rawFunction: null
+        sampleCount: null
+        sourceLink: null
         symbol: null
         symbolAddr: null
         trust: null
         vars: null
       framesOmitted: null
-      hasSystemFrames: false
+      hasSystemFrames: true
       registers: null
     threadId: null
     type: ValueError
@@ -71,9 +83,9 @@ to_json:
       frames:
       - abs_path: foo/baz.py
         data:
-          orig_in_app: 1
+          client_in_app: true
         filename: foo/baz.py
-        in_app: false
+        in_app: true
         lineno: 1
     type: ValueError
     value: hello world
@@ -82,9 +94,9 @@ to_json:
       frames:
       - abs_path: foo/baz.py
         data:
-          orig_in_app: 1
+          client_in_app: true
         filename: foo/baz.py
-        in_app: false
+        in_app: true
         lineno: 1
     type: ValueError
     value: hello world

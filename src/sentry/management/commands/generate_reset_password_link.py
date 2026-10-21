@@ -1,10 +1,10 @@
 import sys
 
+from click import echo
 from django.core.management.base import BaseCommand
 from django.utils import timezone
-from click import echo
 
-from sentry.models import LostPasswordHash
+from sentry.users.models.lostpasswordhash import LostPasswordHash
 from sentry.utils.auth import find_users
 
 

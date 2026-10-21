@@ -1,12 +1,12 @@
 import operator
 import sys
+from functools import reduce
 
-from collections import defaultdict
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
-from sentry.models import Organization, OrganizationMember, User
-from functools import reduce
+from sentry.models.organization import Organization
+from sentry.users.models.user import User
 
 
 class Command(BaseCommand):
@@ -32,17 +32,8 @@ class Command(BaseCommand):
         )
 
     def _get_organization_user_sets(self, organization):
-        queryset = OrganizationMember.objects.filter(organization=organization).select_related(
-            "user"
-        )
-
-        members_by_email = defaultdict(list)
-        for member in queryset:
-            if not member.user:
-                continue
-            members_by_email[member.user.email].append(member.user)
-
-        return list(members_by_email.values())
+        # TODO: This logic cannot work in the hybrid cloud world, entire process needs redesign.
+        raise NotImplementedError
 
     def _confirm_merge(self, primary_user, other_users):
         message = "Merge {} into {}? [Yn] ".format(
@@ -91,7 +82,7 @@ class Command(BaseCommand):
             return
 
         sys.stdout.write(
-            "Found {} unique account(s) with duplicate identities.\n".format(len(unique_users))
+            f"Found {len(unique_users)} unique account(s) with duplicate identities.\n"
         )
 
         for user_list in unique_users:

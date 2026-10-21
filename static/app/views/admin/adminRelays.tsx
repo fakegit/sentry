@@ -1,0 +1,102 @@
+import {useState} from 'react';
+import {IconDelete} from '@sentry/icons/delete';
+import moment from 'moment-timezone';
+
+import {Button} from '@sentry/scraps/button';
+
+import {addErrorMessage} from 'sentry/actionCreators/indicator';
+import {Confirm} from 'sentry/components/confirm';
+import {ResultGrid} from 'sentry/components/resultGrid';
+import {t} from 'sentry/locale';
+import {useApi} from 'sentry/utils/useApi';
+import {BreadcrumbTitle} from 'sentry/views/settings/components/settingsBreadcrumb/breadcrumbTitle';
+
+const prettyDate = (x: string) => moment(x).format('ll LTS');
+
+type RelayRow = {
+  firstSeen: string;
+  id: string;
+  lastSeen: string;
+  publicKey: string;
+  relayId: string;
+};
+
+export default function AdminRelays() {
+  const api = useApi();
+  // TODO: Loading not hooked up to anything?
+  const [, setLoading] = useState(false);
+
+  const onDelete = async (key: string) => {
+    setLoading(true);
+    try {
+      await api.requestPromise(`/relays/${key}/`, {
+        method: 'DELETE',
+      });
+    } catch {
+      addErrorMessage(t('Unable to delete relay'));
+      // oxlint-disable-next-line react/todo
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getRow = (row: RelayRow) => {
+    return [
+      <td key="id">
+        <strong>{row.relayId}</strong>
+      </td>,
+      <td key="key">{row.publicKey}</td>,
+      <td key="firstSeen" style={{textAlign: 'right'}}>
+        {prettyDate(row.firstSeen)}
+      </td>,
+      <td key="lastSeen" style={{textAlign: 'right'}}>
+        {prettyDate(row.lastSeen)}
+      </td>,
+      <td key="tools" style={{textAlign: 'right'}}>
+        <span className="editor-tools">
+          <Confirm
+            message={t('Are you sure you wish to delete this relay?')}
+            onConfirm={() => void onDelete(row.id)}
+          >
+            <Button variant="danger" size="sm" icon={<IconDelete />}>
+              {t('Remove Relay')}
+            </Button>
+          </Confirm>
+        </span>
+      </td>,
+    ];
+  };
+
+  const columns = [
+    <th key="id" style={{width: 350, textAlign: 'left'}}>
+      Relay
+    </th>,
+    <th key="key">Public Key</th>,
+    <th key="firstSeen" style={{width: 150, textAlign: 'right'}}>
+      First seen
+    </th>,
+    <th key="lastSeen" style={{width: 150, textAlign: 'right'}}>
+      Last seen
+    </th>,
+    <th key="tools" />,
+  ];
+
+  return (
+    <div>
+      <BreadcrumbTitle title={t('Relays')} />
+      <ResultGrid
+        path="/manage/relays/"
+        endpoint="/relays/"
+        columns={columns}
+        columnsForRow={getRow}
+        hasSearch={false}
+        sortOptions={[
+          ['firstSeen', 'First seen'],
+          ['lastSeen', 'Last seen'],
+          ['relayId', 'Relay ID'],
+        ]}
+        defaultSort="firstSeen"
+      />
+    </div>
+  );
+}

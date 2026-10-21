@@ -1,97 +1,75 @@
-from collections import defaultdict, namedtuple
+from __future__ import annotations
+
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
-from sentry.models import User, Team
-from sentry.utils.auth import find_users
-from sentry.utils.compat import filter
+
+from sentry.types.actor import Actor, parse_and_validate_actor
 
 
-class Actor(namedtuple("Actor", "id type")):
-    def get_actor_id(self):
-        return "%s:%d" % (self.type.__name__.lower(), self.id)
-
-    @classmethod
-    def from_actor_identifier(cls, actor_identifier):
-        """
-        Returns an Actor tuple corresponding to a User or Team associated with
-        the given identifier.
-
-        Forms `actor_identifier` can take:
-            1231 -> look up User by id
-            "1231" -> look up User by id
-            "user:1231" -> look up User by id
-            "team:1231" -> look up Team by id
-            "maiseythedog" -> look up User by username
-            "maisey@dogsrule.com" -> look up User by primary email
-        """
-        # If we have an integer, fall back to assuming it's a User
-        if isinstance(actor_identifier, int):
-            return Actor(actor_identifier, User)
-
-        # If the actor_identifier is a simple integer as a string,
-        # we're also a User
-        if actor_identifier.isdigit():
-            return Actor(int(actor_identifier), User)
-
-        if actor_identifier.startswith("user:"):
-            return cls(int(actor_identifier[5:]), User)
-
-        if actor_identifier.startswith("team:"):
-            return cls(int(actor_identifier[5:]), Team)
-
-        try:
-            return Actor(find_users(actor_identifier)[0].id, User)
-        except IndexError:
-            raise serializers.ValidationError("Unable to resolve actor identifier")
-
-    def resolve(self):
-        return self.type.objects.get(id=self.id)
-
-    @classmethod
-    def resolve_many(cls, actors):
-        """
-        Resolve multiple actors at the same time. Returns the result in the same order
-        as the input, minus any actors we couldn't resolve.
-        :param actors:
-        :return:
-        """
-        if not actors:
-            return []
-
-        actors_by_type = defaultdict(list)
-        for actor in actors:
-            actors_by_type[actor.type].append(actor)
-
-        results = {}
-        for type, _actors in actors_by_type.items():
-            for instance in type.objects.filter(id__in=[a.id for a in _actors]):
-                results[(type, instance.id)] = instance
-
-        return list(filter(None, [results.get((actor.type, actor.id)) for actor in actors]))
-
-    @classmethod
-    def resolve_dict(cls, actor_dict):
-        actors_by_type = defaultdict(list)
-        for actor in actor_dict.values():
-            actors_by_type[actor.type].append(actor)
-
-        resolved_actors = {}
-        for type, actors in actors_by_type.items():
-            resolved_actors[type] = {
-                actor.id: actor for actor in type.objects.filter(id__in=[a.id for a in actors])
-            }
-
-        return {key: resolved_actors[value.type][value.id] for key, value in actor_dict.items()}
-
-
+@extend_schema_field(field=OpenApiTypes.STR)
 class ActorField(serializers.Field):
+    def __init__(self, *args, **kwds):
+        super().__init__(*args, **kwds)
+
     def to_representation(self, value):
-        return value.get_actor_id()
+        return value.identifier
 
-    def to_internal_value(self, data):
-        if not data:
-            return None
+    def to_internal_value(self, data) -> Actor | None:
+        return parse_and_validate_actor(data, self.context["organization"].id)
 
-        try:
-            return Actor.from_actor_identifier(data)
-        except Exception:
-            raise serializers.ValidationError("Unknown actor input")
+
+@extend_schema_field(field=OpenApiTypes.STR)
+class OwnerActorField(ActorField):
+    """
+    ActorField variant for owner assignment that validates team membership.
+
+    When assigning a team as owner, validation is skipped if:
+    - Open Team Membership is enabled for the organization (users can join any team)
+
+    Otherwise, validates that the requesting user either:
+    - Has team:admin scope, OR
+    - Is a member of the team being assigned
+
+    This prevents IDOR vulnerabilities where users could assign teams they
+    don't belong to as owners when Open Team Membership is disabled.
+    """
+
+    def to_internal_value(self, data) -> Actor | None:
+        actor = super().to_internal_value(data)
+
+        if actor is None:
+            return actor
+
+        if actor.is_team:
+            self._validate_team_assignment(actor)
+
+        return actor
+
+    def _validate_team_assignment(self, actor: Actor) -> None:
+        from sentry.models.organizationmemberteam import OrganizationMemberTeam
+
+        organization = self.context.get("organization")
+
+        if organization and organization.flags.allow_joinleave:
+            return
+
+        request = self.context.get("request")
+        access = self.context.get("access") or getattr(request, "access", None)
+
+        if access and access.has_scope("team:admin"):
+            return
+
+        user = self.context.get("user") or getattr(request, "user", None)
+
+        if not user:
+            raise serializers.ValidationError("You can only assign teams you are a member of")
+
+        if OrganizationMemberTeam.objects.filter(
+            team_id=actor.id,
+            organizationmember__user_id=user.id,
+            is_active=True,
+        ).exists():
+            return
+
+        raise serializers.ValidationError("You can only assign teams you are a member of")

@@ -1,17 +1,15 @@
+from __future__ import annotations
+
+from typing import Any
+
 import pytest
 
-from sentry.grouping.api import get_default_grouping_config_dict, load_grouping_config
-from sentry.stacktraces.processing import (
-    find_stacktraces_in_data,
-    normalize_stacktraces_for_grouping,
-    get_crash_frame_from_event_data,
-)
-from sentry.testutils import TestCase
+from sentry.stacktraces.processing import find_stacktraces_in_data, get_crash_frame_from_event_data
 
 
-class FindStacktracesTest(TestCase):
-    def test_stacktraces_basics(self):
-        data = {
+class TestFindStacktraces:
+    def test_stacktraces_basics(self) -> None:
+        data: dict[str, Any] = {
             "message": "hello",
             "platform": "javascript",
             "stacktrace": {
@@ -37,9 +35,13 @@ class FindStacktracesTest(TestCase):
         assert len(infos) == 1
         assert len(infos[0].stacktrace["frames"]) == 2
         assert infos[0].platforms == {"javascript", "native"}
+        # Top-level stacktraces are not exceptions
+        assert infos[0].is_exception is False
+        assert infos[0].exception_type is None
+        assert infos[0].exception_module is None
 
-    def test_stacktraces_exception(self):
-        data = {
+    def test_stacktraces_exception(self) -> None:
+        data: dict[str, Any] = {
             "message": "hello",
             "platform": "javascript",
             "exception": {
@@ -70,9 +72,43 @@ class FindStacktracesTest(TestCase):
         infos = find_stacktraces_in_data(data)
         assert len(infos) == 1
         assert len(infos[0].stacktrace["frames"]) == 2
+        # Exception stacktraces have type but no module in this case
+        assert infos[0].is_exception is True
+        assert infos[0].exception_type == "Error"
+        assert infos[0].exception_module is None
 
-    def test_stacktraces_threads(self):
-        data = {
+    def test_stacktraces_exception_with_module(self) -> None:
+        data: dict[str, Any] = {
+            "message": "hello",
+            "platform": "java",
+            "exception": {
+                "values": [
+                    {
+                        "type": "RuntimeException",
+                        "module": "java.lang",
+                        "stacktrace": {
+                            "frames": [
+                                {
+                                    "function": "main",
+                                    "module": "com.example.App",
+                                    "filename": "App.java",
+                                    "lineno": 10,
+                                },
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+
+        infos = find_stacktraces_in_data(data)
+        assert len(infos) == 1
+        assert infos[0].is_exception is True
+        assert infos[0].exception_type == "RuntimeException"
+        assert infos[0].exception_module == "java.lang"
+
+    def test_stacktraces_threads(self) -> None:
+        data: dict[str, Any] = {
             "message": "hello",
             "platform": "javascript",
             "threads": {
@@ -103,15 +139,19 @@ class FindStacktracesTest(TestCase):
         infos = find_stacktraces_in_data(data)
         assert len(infos) == 1
         assert len(infos[0].stacktrace["frames"]) == 2
+        # Thread stacktraces are not exceptions
+        assert infos[0].is_exception is False
+        assert infos[0].exception_type is None
+        assert infos[0].exception_module is None
 
-    def test_find_stacktraces_skip_none(self):
+    def test_find_stacktraces_skip_none(self) -> None:
         # This tests:
         #  1. exception is None
         #  2. stacktrace is None
         #  3. frames is None
-        #  3. frames contains only None
-        #  4. frame is None
-        data = {
+        #  4. frames contains only None
+        #  5. frame is None
+        data: dict[str, Any] = {
             "message": "hello",
             "platform": "javascript",
             "exception": {
@@ -144,223 +184,44 @@ class FindStacktracesTest(TestCase):
             },
         }
 
-        infos = find_stacktraces_in_data(data, with_exceptions=True)
-        assert len(infos) == 4
-        assert sum(1 for x in infos if x.stacktrace) == 3
-        assert sum(1 for x in infos if x.is_exception) == 4
-        # XXX: The null frame is still part of this stack trace!
-        assert len(infos[3].stacktrace["frames"]) == 3
-
         infos = find_stacktraces_in_data(data)
         assert len(infos) == 1
         # XXX: The null frame is still part of this stack trace!
         assert len(infos[0].stacktrace["frames"]) == 3
+        assert infos[0].exception_type == "Error"
 
 
-class NormalizeInApptest(TestCase):
-    def test_normalize_with_system_frames(self):
-        data = {
-            "stacktrace": {
-                "frames": [
-                    None,
-                    {
-                        "abs_path": "http://example.com/foo.js",
-                        "filename": "foo.js",
-                        "lineno": 4,
-                        "colno": 0,
-                        "in_app": True,
-                    },
-                    {
-                        "abs_path": "http://example.com/foo.js",
-                        "filename": "foo.js",
-                        "lineno": 1,
-                        "colno": 0,
-                    },
-                ]
-            }
-        }
-
-        normalize_stacktraces_for_grouping(data)
-        assert data["stacktrace"]["frames"][1]["in_app"] is True
-        assert data["stacktrace"]["frames"][2]["in_app"] is False
-
-    def test_normalize_skips_none(self):
-        data = {
-            "stacktrace": {
-                "frames": [
-                    None,
-                    {
-                        "abs_path": "http://example.com/foo.js",
-                        "filename": "foo.js",
-                        "lineno": 4,
-                        "colno": 0,
-                    },
-                    {
-                        "abs_path": "http://example.com/foo.js",
-                        "filename": "foo.js",
-                        "lineno": 1,
-                        "colno": 0,
-                    },
-                ]
-            }
-        }
-
-        normalize_stacktraces_for_grouping(data)
-        assert data["stacktrace"]["frames"][1]["in_app"] is False
-        assert data["stacktrace"]["frames"][2]["in_app"] is False
-
-    def test_ios_package_in_app_detection(self):
-        data = {
-            "platform": "native",
-            "stacktrace": {
-                "frames": [
-                    {
-                        "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                        "instruction_addr": "0x1000",
-                    },
-                    {
-                        "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/Frameworks/foo.dylib",
-                        "instruction_addr": "0x2000",
-                    },
-                    {
-                        "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/Frameworks/libswiftCore.dylib",
-                        "instruction_addr": "0x3000",
-                    },
-                    {"package": "/usr/lib/whatever.dylib", "instruction_addr": "0x4000"},
-                ]
-            },
-        }
-
-        config = load_grouping_config(get_default_grouping_config_dict())
-        normalize_stacktraces_for_grouping(data, grouping_config=config)
-
-        # App object should be in_app
-        assert data["stacktrace"]["frames"][0]["in_app"] is True
-        # Framework should be in app (but optional)
-        assert data["stacktrace"]["frames"][1]["in_app"] is True
-        # libswift should not be system
-        assert data["stacktrace"]["frames"][2]["in_app"] is False
-        # Unknown object should default to not in_app
-        assert data["stacktrace"]["frames"][3]["in_app"] is False
-
-    def tes_macos_package_in_app_detection(self):
-        data = {
-            "platform": "cocoa",
-            "debug_meta": {"images": []},  # omitted
-            "exception": {
-                "values": [
-                    {
-                        "stacktrace": {
-                            "frames": [
-                                {
-                                    "function": "-[CRLCrashAsyncSafeThread crash]",
-                                    "package": "/Users/haza/Library/Developer/Xcode/Archives/2017-06-19/CrashProbe 19-06-2017, 08.53.xcarchive/Products/Applications/CrashProbe.app/Contents/Frameworks/CrashLib.framework/Versions/A/CrashLib",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "[KSCrash ]",
-                                    "package": "/usr/lib/system/libdyld.dylib",
-                                    "instruction_addr": 4295098388,
-                                },
-                            ]
-                        },
-                        "type": "NSRangeException",
-                    }
-                ]
-            },
-            "contexts": {"os": {"version": "10.12.5", "type": "os", "name": "macOS"}},
-        }
-
-        config = load_grouping_config(get_default_grouping_config_dict())
-        normalize_stacktraces_for_grouping(data, grouping_config=config)
-
-        frames = data["exception"]["values"][0]["stacktrace"]["frames"]
-        assert frames[0]["in_app"] is True
-        assert frames[1]["in_app"] is False
-
-    def test_ios_function_name_in_app_detection(self):
-        data = {
-            "platform": "cocoa",
-            "debug_meta": {"images": []},  # omitted
-            "exception": {
-                "values": [
-                    {
-                        "stacktrace": {
-                            "frames": [
-                                {
-                                    "function": "+[RNSentry ]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "+[SentryHub ]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "+[SentryClient ]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "kscrash_foobar",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "kscm_foobar",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "+[KSCrash ]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "+[KSCrash]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                                {
-                                    "function": "+[KSCrashy]",
-                                    "package": "/var/containers/Bundle/Application/B33C37A8-F933-4B6B-9FFA-152282BFDF13/SentryTest.app/SentryTest",
-                                    "instruction_addr": 4295098388,
-                                },
-                            ]
-                        },
-                        "type": "NSRangeException",
-                    }
-                ]
-            },
-            "contexts": {"os": {"version": "9.3.2", "type": "os", "name": "iOS"}},
-        }
-
-        config = load_grouping_config(get_default_grouping_config_dict())
-        normalize_stacktraces_for_grouping(data, grouping_config=config)
-
-        frames = data["exception"]["values"][0]["stacktrace"]["frames"]
-        assert frames[0]["in_app"] is False
-        assert frames[1]["in_app"] is False
-        assert frames[2]["in_app"] is False
-        assert frames[3]["in_app"] is False
-        assert frames[4]["in_app"] is False
-        assert frames[5]["in_app"] is False
-        assert frames[6]["in_app"] is True
-        assert frames[7]["in_app"] is True
+def _thread(**kwargs):
+    return {"stacktrace": {"frames": [{"in_app": True, "marco": "polo"}]}, **kwargs}
 
 
 @pytest.mark.parametrize(
     "event",
     [
-        {"threads": {"values": [{"stacktrace": {"frames": [{"in_app": True, "marco": "polo"}]}}]}},
+        {"threads": {"values": [_thread()]}},
         {
             "exception": {
                 "values": [{"stacktrace": {"frames": [{"in_app": True, "marco": "polo"}]}}]
             }
         },
         {"stacktrace": {"frames": [{"in_app": True, "marco": "polo"}]}},
+        {"threads": {"values": [{"id": 0}, _thread(crashed=True), {"id": 2}]}},
+        {"threads": {"values": [{"id": 0}, _thread(current=True), {"id": 2}]}},
+        {"threads": {"values": [None, _thread()]}},
     ],
 )
-def test_get_crash_frame(event):
+def test_get_crash_frame(event) -> None:
     assert get_crash_frame_from_event_data(event)["marco"] == "polo"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"threads": {"values": []}},
+        {"threads": {"values": [{"id": 0}, {"id": 1}]}},
+        {"threads": {"values": [_thread(crashed=True), _thread(crashed=True)]}},
+        {"threads": {"values": [_thread(current=True), _thread(current=True)]}},
+    ],
+)
+def test_get_crash_frame_returns_none(event) -> None:
+    assert get_crash_frame_from_event_data(event) is None

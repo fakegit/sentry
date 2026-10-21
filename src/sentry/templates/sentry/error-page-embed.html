@@ -29,6 +29,8 @@
   text-align: left;
   border: 1px solid #fff;
   padding: 40px;
+  padding-top: calc(40px + constant(safe-area-inset-top));
+  padding-top: calc(40px + env(safe-area-inset-top));
   max-width: 700px;
   overflow: auto;
   border-radius: 3px;
@@ -150,6 +152,7 @@
   font-weight: 500;
   cursor: pointer;
   float: left;
+  border: none;
 }
 .sentry-error-embed .form-submit .btn:hover {
   background: #1D87CE;
@@ -204,6 +207,8 @@
 @media screen and (max-width: 660px) {
   .sentry-error-embed {
     padding: 10px;
+    padding-top: calc(10px + constant(safe-area-inset-top));
+    padding-top: calc(10px + env(safe-area-inset-top));
     max-width: none;
   }
   .sentry-error-embed h2 {
@@ -216,6 +221,8 @@
 @media screen and (max-width: 480px) {
   .sentry-error-embed {
     padding: 10px;
+    padding-top: calc(10px + constant(safe-area-inset-top));
+    padding-top: calc(10px + env(safe-area-inset-top));
     margin-top: 0;
     position: absolute;
     top: 0;
@@ -253,9 +260,9 @@
 }
 </style>
 
-<div class="sentry-error-embed clearfix">
+<div class="sentry-error-embed clearfix" role="dialog" aria-modal="true" aria-labelledby="sentry-error-embed-heading">
   <header>
-    <h2>{{ title }}</h2>
+    <h2 id="sentry-error-embed-heading">{{ title }}</h2>
     <p>{{ subtitle }} <span>{{ subtitle2 }}</span></p>
   </header>
   <form>
@@ -276,7 +283,7 @@
     </div>
     <div class="form-submit clearfix">
       <button type="submit" class="btn">{{ submit_label }}</button>
-      <a class="close">{{ close_label }}</a>
+      <button class="close">{{ close_label }}</button>
       {% if show_branding %}
       <p class="powered-by">
         {% trans "Crash reports powered by <a href=\"https://sentry.io\">Sentry</a>" %}

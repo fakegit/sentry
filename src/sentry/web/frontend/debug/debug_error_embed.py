@@ -1,22 +1,26 @@
-from django.conf import settings
-from django.views.generic import View
 from urllib.parse import urlencode
 
-from sentry.models import ProjectKey
+from django.conf import settings
+from django.http import HttpRequest, HttpResponse
+from django.views.generic import View
+
+from sentry.models.projectkey import ProjectKey
+from sentry.web.frontend.base import internal_cell_silo_view
 from sentry.web.helpers import render_to_response
 
 
+@internal_cell_silo_view
 class DebugErrorPageEmbedView(View):
-    def _get_project_key(self):
+    def _get_project_key(self) -> ProjectKey:
         return ProjectKey.objects.filter(project=settings.SENTRY_PROJECT)[0]
 
-    def get(self, request):
+    def get(self, request: HttpRequest) -> HttpResponse:
         context = {
             "query_params": urlencode(
                 {
                     "dsn": self._get_project_key().dsn_public,
-                    "event_id": "342a3d7f690a49f8bd7c4cf0e61a9ded",
-                    "options": dict(**request.GET),
+                    "eventId": "342a3d7f690a49f8bd7c4cf0e61a9ded",
+                    **request.GET,
                 }
             )
         }
